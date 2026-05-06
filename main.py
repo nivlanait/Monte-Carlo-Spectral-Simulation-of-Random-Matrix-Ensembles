@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import warnings
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,29 +11,29 @@ import matplotlib.pyplot as plt
 # Random Matrix Ensembles
 # =========================
 
-def goe_matrix(n: int) -> np.ndarray:
+def goe_matrix(n: int, rng: np.random.Generator) -> np.ndarray:
     """
     Generate an n x n real symmetric matrix from a GOE-like ensemble.
     """
-    A = np.random.normal(size=(n, n))
+    A = rng.standard_normal(size=(n, n))
     H = (A + A.T) / 2
     return H / np.sqrt(n)
 
 
-def gue_matrix(n: int) -> np.ndarray:
+def gue_matrix(n: int, rng: np.random.Generator) -> np.ndarray:
     """
     Generate an n x n complex Hermitian matrix from a GUE-like ensemble.
     """
-    A = np.random.normal(size=(n, n)) + 1j * np.random.normal(size=(n, n))
+    A = rng.standard_normal(size=(n, n)) + 1j * rng.standard_normal(size=(n, n))
     H = (A + A.conj().T) / 2
     return H / np.sqrt(n)
 
 
-def poisson_eigenvalues(n: int) -> np.ndarray:
+def poisson_eigenvalues(n: int, rng: np.random.Generator) -> np.ndarray:
     """
     Generate uncorrelated eigenvalues as a Poisson baseline.
     """
-    return np.sort(np.random.uniform(-1, 1, size=n))
+    return np.sort(rng.uniform(-1, 1, size=n))
 
 
 # =========================
@@ -62,29 +63,42 @@ def normalized_spacings(eigs: np.ndarray, trim_fraction: float = 0.15) -> np.nda
 
     gaps = np.diff(center)
     mean_gap = np.mean(gaps)
-
     if mean_gap <= 0:
         raise ValueError("Mean spacing is zero or negative; cannot normalize spacings.")
 
     return gaps / mean_gap
 
 
-def sample_eigenvalues(ensemble: str, n: int) -> np.ndarray:
+def sample_eigenvalues(ensemble: str, n: int, rng: np.random.Generator) -> np.ndarray:
     """
     Generate eigenvalues from the selected ensemble.
     """
     if ensemble == "goe":
-        H = goe_matrix(n)
+        H = goe_matrix(n, rng)
         return np.linalg.eigvalsh(H)
-
     if ensemble == "gue":
-        H = gue_matrix(n)
+        H = gue_matrix(n, rng)
         return np.linalg.eigvalsh(H)
-
     if ensemble == "poisson":
-        return poisson_eigenvalues(n)
-
+        return poisson_eigenvalues(n, rng)
     raise ValueError(f"Unknown ensemble: {ensemble}")
+
+
+def _worker_run_chunk(args: tuple) -> np.ndarray:
+    """
+    Worker function for multiprocessing. Runs a chunk of Monte Carlo trials
+    using its own seeded random generator for reproducibility.
+
+    Each worker receives a SeedSequence spawned from the master, which
+    guarantees statistically independent streams across processes.
+    """
+    ensemble, n, trials_in_chunk, trim_fraction, seed_seq = args
+    rng = np.random.default_rng(seed_seq)
+    chunk = []
+    for _ in range(trials_in_chunk):
+        eigs = sample_eigenvalues(ensemble, n, rng)
+        chunk.append(normalized_spacings(eigs, trim_fraction=trim_fraction))
+    return np.concatenate(chunk) if chunk else np.empty(0)
 
 
 def collect_spacings(
@@ -92,18 +106,45 @@ def collect_spacings(
     n: int,
     trials: int,
     trim_fraction: float,
+    workers: int = 1,
+    seed: int | None = None,
 ) -> np.ndarray:
     """
     Run Monte Carlo trials and collect normalized eigenvalue spacings.
+
+    Parameters
+    ----------
+    workers : int
+        Number of parallel processes. workers=1 runs serially.
+    seed : int | None
+        Master seed. Each worker is given an independent stream derived
+        from this seed using NumPy's SeedSequence.spawn(), so results are
+        reproducible regardless of worker count.
     """
-    all_spacings = []
+    seed_seq = np.random.SeedSequence(seed)
 
-    for _ in range(trials):
-        eigs = sample_eigenvalues(ensemble, n)
-        spacings = normalized_spacings(eigs, trim_fraction=trim_fraction)
-        all_spacings.append(spacings)
+    if workers <= 1:
+        rng = np.random.default_rng(seed_seq)
+        all_spacings = []
+        for _ in range(trials):
+            eigs = sample_eigenvalues(ensemble, n, rng)
+            all_spacings.append(normalized_spacings(eigs, trim_fraction=trim_fraction))
+        return np.concatenate(all_spacings)
 
-    return np.concatenate(all_spacings)
+    base, extra = divmod(trials, workers)
+    chunk_sizes = [base + (1 if i < extra else 0) for i in range(workers)]
+    chunk_sizes = [c for c in chunk_sizes if c > 0]
+
+    child_seeds = seed_seq.spawn(len(chunk_sizes))
+    job_args = [
+        (ensemble, n, size, trim_fraction, child_seeds[i])
+        for i, size in enumerate(chunk_sizes)
+    ]
+
+    with Pool(processes=len(chunk_sizes)) as pool:
+        results = pool.map(_worker_run_chunk, job_args)
+
+    return np.concatenate(results)
 
 
 # =========================
@@ -113,30 +154,21 @@ def collect_spacings(
 def load_matrices_from_file(path: str) -> list[np.ndarray]:
     """
     Load one or more square matrices from a file.
-
-    Supported formats:
-    - .npy
-    - .npz
-    - .txt
-    - .csv
-    - .dat
+    Supported formats: .npy, .npz, .txt, .csv, .dat
     """
     path_obj = Path(path)
     suffix = path_obj.suffix.lower()
 
     if suffix == ".npy":
         data = np.load(path_obj, allow_pickle=False)
-
     elif suffix == ".npz":
         archive = np.load(path_obj, allow_pickle=False)
         if len(archive.files) != 1:
             raise ValueError(".npz file must contain exactly one array.")
         data = archive[archive.files[0]]
-
     elif suffix in {".txt", ".csv", ".dat"}:
         delimiter = "," if suffix == ".csv" else None
         data = np.loadtxt(path_obj, dtype=np.complex128, delimiter=delimiter)
-
     else:
         raise ValueError("Unsupported file type. Use .npy, .npz, .txt, .csv, or .dat.")
 
@@ -150,7 +182,6 @@ def load_matrices_from_file(path: str) -> list[np.ndarray]:
     for i, matrix in enumerate(matrices):
         if matrix.shape[0] != matrix.shape[1]:
             raise ValueError(f"Matrix {i} is not square.")
-
         if not np.allclose(matrix, matrix.conj().T, atol=1e-8):
             warnings.warn(
                 f"Matrix {i} is not Hermitian; symmetrizing using (M + M^H) / 2.",
@@ -169,12 +200,10 @@ def spacings_from_matrices(
     Compute normalized spacings from input matrices.
     """
     all_spacings = []
-
     for matrix in matrices:
         eigs = np.linalg.eigvalsh(matrix)
         spacings = normalized_spacings(eigs, trim_fraction=trim_fraction)
         all_spacings.append(spacings)
-
     return np.concatenate(all_spacings)
 
 
@@ -210,7 +239,6 @@ def plot_results(
     curves = theory_curves(s)
 
     plt.figure(figsize=(9, 5.5))
-
     plt.hist(
         spacings,
         bins=bins,
@@ -244,7 +272,6 @@ def plot_input_vs_simulated(
     with theoretical curves overlaid.
     """
     plt.figure(figsize=(10, 6))
-
     plt.hist(input_spacings, bins=bins, density=True, alpha=0.55, label="Input matrix")
     plt.hist(goe_spacings, bins=bins, density=True, alpha=0.30, label="Simulated GOE")
     plt.hist(gue_spacings, bins=bins, density=True, alpha=0.30, label="Simulated GUE")
@@ -252,7 +279,6 @@ def plot_input_vs_simulated(
 
     s = np.linspace(0, 4, 400)
     curves = theory_curves(s)
-
     plt.plot(s, curves["GOE Wigner surmise"], linewidth=1.5, linestyle="--", label="GOE theory")
     plt.plot(s, curves["GUE Wigner surmise"], linewidth=1.5, linestyle="--", label="GUE theory")
     plt.plot(s, curves["Poisson baseline"], linewidth=1.5, linestyle="--", label="Poisson theory")
@@ -271,9 +297,6 @@ def plot_input_vs_simulated(
 # =========================
 
 def print_summary(spacings: np.ndarray, label: str = "Dataset") -> None:
-    """
-    Print summary statistics for one spacing dataset.
-    """
     print(f"\n===== Summary Statistics: {label} =====")
     print(f"Collected spacings: {len(spacings)}")
     print(f"Mean spacing: {np.mean(spacings):.4f}")
@@ -285,9 +308,6 @@ def print_summary(spacings: np.ndarray, label: str = "Dataset") -> None:
 
 
 def print_interpretation() -> None:
-    """
-    Print interpretation notes.
-    """
     print("\nInterpretation:")
     print("- Smaller P(s < 0.1) suggests stronger level repulsion.")
     print("- GOE/GUE ensembles should suppress tiny gaps more than Poisson.")
@@ -306,111 +326,50 @@ def main() -> None:
             "nearest-neighbor spacings against theoretical curves."
         )
     )
-
+    parser.add_argument("--ensemble", choices=["goe", "gue", "poisson"], default="gue")
+    parser.add_argument("--input", "-i", type=str, help="Path to a matrix file.")
+    parser.add_argument("--compare-simulated", action="store_true")
+    parser.add_argument("--n", type=int, default=120, help="Matrix dimension.")
+    parser.add_argument("--trials", type=int, default=80, help="Number of Monte Carlo trials.")
+    parser.add_argument("--trim-fraction", type=float, default=0.15)
+    parser.add_argument("--bins", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=281)
+    parser.add_argument("--no-plot", action="store_true")
     parser.add_argument(
-        "--ensemble",
-        choices=["goe", "gue", "poisson"],
-        default="gue",
-        help="Random matrix ensemble to simulate.",
-    )
-
-    parser.add_argument(
-        "--input",
-        "-i",
-        type=str,
-        help="Path to a matrix file to load instead of generating random matrices.",
-    )
-
-    parser.add_argument(
-        "--compare-simulated",
-        action="store_true",
-        help="When using --input, also simulate GOE, GUE, and Poisson spacings for comparison.",
-    )
-
-    parser.add_argument(
-        "--n",
+        "--workers",
         type=int,
-        default=120,
-        help="Matrix dimension or number of Poisson eigenvalues.",
+        default=1,
+        help=(
+            "Number of parallel worker processes for Monte Carlo trials. "
+            "Use 1 (default) for serial execution, or -1 to use all available CPU cores."
+        ),
     )
-
-    parser.add_argument(
-        "--trials",
-        type=int,
-        default=80,
-        help="Number of Monte Carlo trials.",
-    )
-
-    parser.add_argument(
-        "--trim-fraction",
-        type=float,
-        default=0.15,
-        help="Fraction of eigenvalues to trim from each spectral edge.",
-    )
-
-    parser.add_argument(
-        "--bins",
-        type=int,
-        default=50,
-        help="Number of histogram bins.",
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=281,
-        help="Random seed for reproducibility.",
-    )
-
-    parser.add_argument(
-        "--no-plot",
-        action="store_true",
-        help="Skip plotting and only print summary statistics.",
-    )
-
     args = parser.parse_args()
 
     if args.n < 3:
         raise ValueError("--n must be at least 3.")
-
     if args.trials < 1:
         raise ValueError("--trials must be at least 1.")
 
-    np.random.seed(args.seed)
+    workers = cpu_count() if args.workers == -1 else max(1, args.workers)
 
     if args.input:
         matrices = load_matrices_from_file(args.input)
-        spacings = spacings_from_matrices(
-            matrices,
-            trim_fraction=args.trim_fraction,
-        )
-
+        spacings = spacings_from_matrices(matrices, trim_fraction=args.trim_fraction)
         print(f"Loaded {len(matrices)} matrix/matrices from {args.input}.")
         print_summary(spacings, label="Input Matrix")
         print_interpretation()
 
         if args.compare_simulated:
             goe_spacings = collect_spacings(
-                ensemble="goe",
-                n=args.n,
-                trials=args.trials,
-                trim_fraction=args.trim_fraction,
+                "goe", args.n, args.trials, args.trim_fraction, workers, args.seed
             )
-
             gue_spacings = collect_spacings(
-                ensemble="gue",
-                n=args.n,
-                trials=args.trials,
-                trim_fraction=args.trim_fraction,
+                "gue", args.n, args.trials, args.trim_fraction, workers, args.seed + 1
             )
-
             poisson_spacings = collect_spacings(
-                ensemble="poisson",
-                n=args.n,
-                trials=args.trials,
-                trim_fraction=args.trim_fraction,
+                "poisson", args.n, args.trials, args.trim_fraction, workers, args.seed + 2
             )
-
             print_summary(goe_spacings, label="Simulated GOE")
             print_summary(gue_spacings, label="Simulated GUE")
             print_summary(poisson_spacings, label="Simulated Poisson")
@@ -418,45 +377,43 @@ def main() -> None:
 
             if not args.no_plot:
                 plot_input_vs_simulated(
-                    input_spacings=spacings,
-                    goe_spacings=goe_spacings,
-                    gue_spacings=gue_spacings,
-                    poisson_spacings=poisson_spacings,
-                    bins=args.bins,
+                    spacings, goe_spacings, gue_spacings, poisson_spacings, args.bins
                 )
-
         elif not args.no_plot:
             plot_results(
-                spacings=spacings,
-                bins=args.bins,
-                title="Spectral Spacing Analysis of Input Matrix Data",
+                spacings, args.bins,
+                "Spectral Spacing Analysis of Input Matrix Data",
                 selected_ensemble=None,
             )
-
     else:
         spacings = collect_spacings(
-            ensemble=args.ensemble,
-            n=args.n,
-            trials=args.trials,
-            trim_fraction=args.trim_fraction,
+            args.ensemble, args.n, args.trials, args.trim_fraction, workers, args.seed
         )
-
+        worker_msg = f" using {workers} worker(s)" if workers > 1 else ""
         print(
             f"Generated {args.trials} Monte Carlo samples from "
-            f"{args.ensemble.upper()} with n = {args.n}."
+            f"{args.ensemble.upper()} with n = {args.n}{worker_msg}."
         )
-
         print_summary(spacings, label=args.ensemble.upper())
         print_interpretation()
 
         if not args.no_plot:
             plot_results(
-                spacings=spacings,
-                bins=args.bins,
-                title=f"Monte Carlo Spectral Simulation: {args.ensemble.upper()} Ensemble",
+                spacings, args.bins,
+                f"Monte Carlo Spectral Simulation: {args.ensemble.upper()} Ensemble",
                 selected_ensemble=args.ensemble,
             )
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    import sys
+    # Use 'fork' on Unix/macOS for fast worker startup; 'spawn' is the only
+    # option on Windows. Wrap in try/except in case the start method has
+    # already been set elsewhere.
+    if sys.platform != "win32":
+        try:
+            multiprocessing.set_start_method("fork", force=True)
+        except RuntimeError:
+            pass
     main()
